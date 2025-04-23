@@ -34,8 +34,7 @@ CONSOLE_SOURCES = {
     },
      "Nintendo 64": {
         "subfolder": "n64",
-        "urls": ["https://myrient.erista.me/files/No-Intro/Nintendo%20-%20Nintendo%2064%20(Decrypted)/",
-                 "https://myrient.erista.me/files/No-Intro/Nintendo%20-%20Nintendo%2064%20(Encrypted)/"]
+        "urls": ["https://myrient.erista.me/files/No-Intro/Nintendo%20-%20Nintendo%2064%20(BigEndian)/"]
     },
     "Game Boy Color": {
         "subfolder": "gbc",
@@ -73,7 +72,7 @@ CONSOLE_SOURCES = {
     },
     # --- Sony ---
     "PlayStation": {
-        "subfolder": "ps1",
+        "subfolder": "psx",
         "urls": ["https://myrient.erista.me/files/No-Intro/Sony%20-%20PlayStation/", # Set No-Intro (puede tener .zip/.7z?)
                  "https://myrient.erista.me/files/Redump/Sony%20-%20PlayStation/"] # Set Redump (no .zip/.7z)
     },
@@ -819,8 +818,15 @@ def run_scp_transfer(ip, user, password, local_base_path, local_console_dirs):
     sftp = None
     copied_count = 0
     skipped_count = 0
+    extracted_count = 0
     error_count = 0
     errors_list = []
+    
+    # Lista de consolas que necesitan extracción de archivos comprimidos
+    consolas_extraer = [
+        'psp', 'psx', 'dreamcast', 'n64', 'saturn', 
+        'gamecube', 'gc', 'wii', 'ps2'
+    ]
 
     def update_status(message):
         # Función segura para actualizar la GUI desde el hilo
@@ -834,6 +840,51 @@ def run_scp_transfer(ip, user, password, local_base_path, local_console_dirs):
             app.after(0, messagebox.showwarning, title, message)
         else:
             app.after(0, messagebox.showinfo, title, message)
+    
+    def get_base_filename(filename):
+        """Obtiene el nombre base del archivo sin la extensión"""
+        return os.path.splitext(filename)[0]
+    
+    def extract_zip_on_remote(remote_file_path, remote_dir_path):
+        """Extrae el archivo zip en el servidor remoto y elimina el zip original"""
+        try:
+            # Usar comandos de línea de comando en el servidor remoto para extraer
+            update_status(f"Extrayendo en RetroPie: {os.path.basename(remote_file_path)}...")
+            
+            # Primero verificar qué utilidad de descompresión está disponible
+            stdin, stdout, stderr = ssh.exec_command('which unzip 7z')
+            available_tools = stdout.read().decode().strip().split('\n')
+            
+            extract_cmd = ""
+            if any('unzip' in tool for tool in available_tools):
+                # Usar unzip si está disponible (más común)
+                extract_cmd = f'unzip -o "{remote_file_path}" -d "{remote_dir_path}" && rm "{remote_file_path}"'
+            elif any('7z' in tool for tool in available_tools):
+                # Usar 7z como alternativa
+                extract_cmd = f'7z x "{remote_file_path}" -o"{remote_dir_path}" && rm "{remote_file_path}"'
+            else:
+                # Intentar instalar unzip si no está disponible
+                update_status("Instalando herramienta de extracción en RetroPie...")
+                ssh.exec_command('sudo apt-get update && sudo apt-get install -y unzip')
+                extract_cmd = f'unzip -o "{remote_file_path}" -d "{remote_dir_path}" && rm "{remote_file_path}"'
+            
+            # Ejecutar el comando de extracción
+            stdin, stdout, stderr = ssh.exec_command(extract_cmd)
+            
+            # Esperar a que termine la extracción
+            exit_code = stdout.channel.recv_exit_status()
+            
+            if exit_code != 0:
+                error_msg = stderr.read().decode().strip()
+                raise Exception(f"Error en extracción (código {exit_code}): {error_msg}")
+                
+            return True
+            
+        except Exception as e:
+            error_msg = f"Error extrayendo {os.path.basename(remote_file_path)}: {e}"
+            errors_list.append(error_msg)
+            update_status(f"Error de extracción: {os.path.basename(remote_file_path)}")
+            return False
 
     try:
         update_status(f"Conectando a {ip} como {user}...")
@@ -872,6 +923,9 @@ def run_scp_transfer(ip, user, password, local_base_path, local_console_dirs):
         for console_dir in local_console_dirs:
             local_console_path = os.path.join(local_base_path, console_dir)
             remote_console_path = f"{remote_base_path}/{console_dir}" # Usar / para rutas remotas
+            
+            # Identificar si esta consola necesita extracción
+            needs_extraction = console_dir.lower() in consolas_extraer
 
             update_status(f"Procesando consola: {console_dir}...")
 
@@ -894,7 +948,7 @@ def run_scp_transfer(ip, user, password, local_base_path, local_console_dirs):
             try:
                 local_files = [f for f in os.listdir(local_console_path)
                                if os.path.isfile(os.path.join(local_console_path, f))
-                               and (f.lower().endswith('.zip') or f.lower().endswith('.7z'))] # Solo ROMs
+                               and (f.lower().endswith('.zip') or f.lower().endswith('.7z'))] # Solo ROMs comprimidas
                 total_local_files += len(local_files)
             except Exception as e:
                  error_msg = f"Error leyendo archivos locales en {local_console_path}: {e}"
@@ -906,14 +960,20 @@ def run_scp_transfer(ip, user, password, local_base_path, local_console_dirs):
             if not local_files:
                 continue # No hay ROMs locales para esta consola
 
-            # Listar archivos remotos y sus tamaños
-            remote_files_info = {} # Cambiado a diccionario {filename: size}
+            # Listar archivos remotos y almacenar en un conjunto (más eficiente para búsquedas)
+            remote_files_info = {} # {filename: size}
+            remote_base_names = set() # Conjunto de nombres base sin extensión
             try:
                 # Listdir puede ser lento en directorios grandes, pero necesario
                 remote_listing = sftp.listdir_attr(remote_console_path)
-                # Guardar nombre y tamaño solo para archivos regulares
-                remote_files_info = {item.filename: item.st_size
-                                     for item in remote_listing if stat.S_ISREG(item.st_mode)}
+                
+                # Almacenar tanto los nombres con extensión como los nombres base
+                for item in remote_listing:
+                    if stat.S_ISREG(item.st_mode):  # Solo archivos regulares
+                        remote_files_info[item.filename] = item.st_size
+                        # Añadir nombre base (sin extensión) al conjunto
+                        remote_base_names.add(get_base_filename(item.filename))
+                        
             except (paramiko.SFTPError, IOError) as e:
                  error_msg = f"Error listando archivos remotos en {remote_console_path}: {e}"
                  errors_list.append(error_msg)
@@ -928,6 +988,10 @@ def run_scp_transfer(ip, user, password, local_base_path, local_console_dirs):
                 local_file_path = os.path.join(local_console_path, filename)
                 remote_file_path = f"{remote_console_path}/{filename}"
                 local_file_size = 0
+                
+                # Obtener nombre base para comparación
+                base_filename = get_base_filename(filename)
+                
                 try:
                     local_file_size = os.path.getsize(local_file_path)
                 except OSError as e:
@@ -944,31 +1008,38 @@ def run_scp_transfer(ip, user, password, local_base_path, local_console_dirs):
                 copy_file = False
                 reason = ""
 
-                if filename in remote_files_info:
+                # NUEVO: Comprobar si el nombre base ya existe en el destino
+                if base_filename in remote_base_names:
+                    # El archivo ya existe con otra extensión, no copiamos
+                    skipped_count += 1
+                    continue
+                elif filename in remote_files_info:
                     remote_file_size = remote_files_info[filename]
                     if local_file_size != remote_file_size:
                         copy_file = True
                         reason = f"Tamaño difiere (Local: {local_file_size}, Remoto: {remote_file_size})"
-                        # print(f"Sobrescribiendo (tamaño difiere): {remote_file_path}")
                     else:
-                        # print(f"Saltando (ya existe y tamaño coincide): {remote_file_path}")
                         skipped_count += 1
                 else:
                     copy_file = True
                     reason = "No existe remotamente"
-                    # print(f"Copiando (no existe): {remote_file_path}")
 
                 if copy_file:
                     try:
                         update_status(f"[{progress_perc}%] Copiando {console_dir}/{filename[:30]}... ({reason})")
                         sftp.put(local_file_path, remote_file_path)
                         copied_count += 1
+                        
+                        # Si la consola requiere extracción, extraer el archivo
+                        if needs_extraction and (filename.lower().endswith('.zip') or filename.lower().endswith('.7z')):
+                            if extract_zip_on_remote(remote_file_path, remote_console_path):
+                                extracted_count += 1
+                                
                     except (paramiko.SFTPError, IOError, OSError) as e:
                         error_msg = f"Error copiando {filename} a {remote_console_path}: {e}"
                         errors_list.append(error_msg)
                         update_status(f"Error al copiar {filename[:40]}...")
                         error_count += 1
-                        # Intentar eliminar archivo parcial remoto si falló la copia? (Complejo, omitido por ahora)
 
         # Fin del bucle de consolas
         update_status("Proceso de copia finalizado.")
@@ -1009,7 +1080,8 @@ def run_scp_transfer(ip, user, password, local_base_path, local_console_dirs):
         # Mostrar resumen final
         summary_message = f"Copia a RetroPie finalizada.\n\n" \
                           f"Copiados/Sobrescritos: {copied_count}\n" \
-                          f"Omitidos (ya existen y tamaño coincide): {skipped_count}\n" \
+                          f"Extraídos: {extracted_count}\n" \
+                          f"Omitidos (ya existen): {skipped_count}\n" \
                           f"Errores: {error_count}"
 
         if errors_list:
@@ -1039,7 +1111,7 @@ def run_scp_transfer(ip, user, password, local_base_path, local_console_dirs):
             elif error_count > 0 :
                  status_label.config(text=f"Copia finalizada con {error_count} errores.")
             else:
-                 final_success_msg = f"Copia a RetroPie completada. Copiados/Sobrescritos: {copied_count}, Omitidos: {skipped_count}."
+                 final_success_msg = f"Copia a RetroPie completada. Copiados: {copied_count}, Extraídos: {extracted_count}, Omitidos: {skipped_count}."
                  final_success_msg += "\n\nRecuerda reiniciar EmulationStation (Start > Quit > Restart EmulationStation) para ver los nuevos juegos."
                  final_success_msg += "\nPuedes buscar carátulas desde el menú (Start > Scraper)."
                  status_label.config(text=final_success_msg)
